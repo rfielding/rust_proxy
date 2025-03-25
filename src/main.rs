@@ -8,7 +8,7 @@ use std::sync::Arc;
 use hyper::upgrade::Upgraded;
 use tokio::net::TcpStream;
 use futures_util::future::try_join;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncWriteExt};
 
 // Configuration for our path-based routing proxy
 struct ProxyConfig {
@@ -160,31 +160,45 @@ async fn proxy_request(
 
 #[tokio::main]
 async fn main() {
+    // Get command line arguments
+    let args: Vec<String> = std::env::args().collect();
+    
+    // Check if --fwd flag is present
+    let fwd_index = args.iter().position(|arg| arg == "--fwd");
+    
+    if fwd_index.is_none() {
+        eprintln!("Usage: {} --fwd [path url]... [default url]", args[0]);
+        eprintln!("Example: {} --fwd /auth http://docker:9932 default http://localhost:5173", args[0]);
+        std::process::exit(1);
+    }
+    
     // Create client to send requests to backends
     let client = Client::new();
     
     // Configure path-based routing
     let mut config = ProxyConfig::new();
     
-    // Add route mappings for different microservices
-    config.add_route("/api/users", "http://user-service:8081");
-    config.add_route("/api/products", "http://product-service:8082");
-    config.add_route("/api/orders", "http://order-service:8083");
-    config.add_route("/auth", "http://auth-service:8084");
-    
-    // Nested paths - more specific paths should be added first
-    config.add_route("/api/products/inventory", "http://inventory-service:8085");
-    
-    // Set a default backend for unmatched paths
-    config.set_default_backend("http://localhost:5173");
-    
-    // Print route configuration before wrapping in Arc
-    println!("Configured routes:");
-    for (path, backend) in &config.route_map {
-        println!("  {} -> {}", path, backend);
-    }
-    if let Some(backend) = &config.default_backend {
-        println!("  Default -> {}", backend);
+    // Process forwarding rules
+    let fwd_args = &args[fwd_index.unwrap() + 1..];
+    let mut i = 0;
+    while i < fwd_args.len() {
+        if i + 1 >= fwd_args.len() {
+            eprintln!("Error: Each path must have a corresponding URL");
+            std::process::exit(1);
+        }
+        
+        let path = &fwd_args[i];
+        let url = &fwd_args[i + 1];
+        
+        if path == "default" {
+            config.set_default_backend(url);
+            println!("Setting default backend to: {}", url);
+        } else {
+            config.add_route(path, url);
+            println!("Adding route: {} -> {}", path, url);
+        }
+        
+        i += 2;
     }
     
     // Wrap config in Arc for sharing across requests
@@ -193,7 +207,7 @@ async fn main() {
     // Define the address to bind to
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
     
-    println!("Path-based reverse proxy listening on http://{}", addr);
+    println!("\nPath-based reverse proxy listening on http://{}", addr);
     
     // Create a service function to handle each request
     let make_svc = make_service_fn(move |_conn| {
