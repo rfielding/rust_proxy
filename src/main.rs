@@ -1,7 +1,7 @@
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::collections::HashMap;
-use hyper::{Body, Client, Request, Response, Server, StatusCode};
+use hyper::{Body, Client, Request, Response, Server, StatusCode, Uri};
 use hyper::client::HttpConnector;
 use hyper::service::{make_service_fn, service_fn};
 use std::sync::Arc;
@@ -44,7 +44,8 @@ impl ProxyConfig {
         matches.sort_by(|(a, _), (b, _)| b.len().cmp(&a.len()));
         
         // Return the backend with the longest matching prefix, or the default backend
-        matches.first().map(|(_, backend)| backend.clone())
+        matches.first()
+            .map(|(_, backend)| backend.to_string())
             .or_else(|| self.default_backend.clone())
     }
 }
@@ -65,7 +66,7 @@ async fn proxy_request(
         
         // Construct the new URI
         let uri_string = format!("{}{}", backend, parts.uri.path_and_query().map(|x| x.as_str()).unwrap_or(""));
-        let uri = uri_string.parse().unwrap();
+        let uri: Uri = uri_string.parse().unwrap();
         
         // Create a new request with the same method, headers, and body
         let mut new_req = Request::builder()
@@ -115,11 +116,22 @@ async fn main() {
     // Set a default backend for unmatched paths
     config.set_default_backend("http://frontend-service:8080");
     
+    // Print route configuration before wrapping in Arc
+    println!("Configured routes:");
+    for (path, backend) in &config.route_map {
+        println!("  {} -> {}", path, backend);
+    }
+    if let Some(backend) = &config.default_backend {
+        println!("  Default -> {}", backend);
+    }
+    
     // Wrap config in Arc for sharing across requests
     let config = Arc::new(config);
     
     // Define the address to bind to
     let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    
+    println!("Path-based reverse proxy listening on http://{}", addr);
     
     // Create a service function to handle each request
     let make_svc = make_service_fn(move |_conn| {
@@ -137,15 +149,6 @@ async fn main() {
             }))
         }
     });
-    
-    println!("Path-based reverse proxy listening on http://{}", addr);
-    println!("Configured routes:");
-    for (path, backend) in &config.route_map {
-        println!("  {} -> {}", path, backend);
-    }
-    if let Some(backend) = &config.default_backend {
-        println!("  Default -> {}", backend);
-    }
     
     // Start the server
     let server = Server::bind(&addr).serve(make_svc);
