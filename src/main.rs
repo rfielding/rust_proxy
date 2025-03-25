@@ -7,8 +7,8 @@ use hyper::service::{make_service_fn, service_fn};
 use std::sync::Arc;
 use hyper::upgrade::Upgraded;
 use tokio::net::TcpStream;
-use futures_util::future::try_join;
-use tokio::io::{AsyncWriteExt};
+use sha1::{Sha1, Digest};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 
 // Configuration for our path-based routing proxy
 struct ProxyConfig {
@@ -54,28 +54,38 @@ impl ProxyConfig {
     }
 }
 
-// Add this new function to handle WebSocket connections
+fn generate_websocket_accept(key: &str) -> String {
+    let mut sha1 = Sha1::new();
+    sha1.update(format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key));
+    BASE64.encode(sha1.finalize())
+}
+
 async fn proxy_websocket(
     upgraded: Upgraded,
     backend_uri: String,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Connect to the backend
-    let stream = TcpStream::connect(backend_uri).await?;
+    let uri_str = backend_uri.replace("http://", "");
+    let (host, port) = if let Some(idx) = uri_str.find(':') {
+        (&uri_str[..idx], uri_str[idx+1..].parse::<u16>().unwrap_or(80))
+    } else {
+        (uri_str.as_str(), 80)
+    };
+
+    let stream = TcpStream::connect((host, port)).await?;
     let (mut client_rd, mut client_wr) = tokio::io::split(upgraded);
     let (mut server_rd, mut server_wr) = tokio::io::split(stream);
 
-    // Copy bidirectionally
     let client_to_server = async {
         tokio::io::copy(&mut client_rd, &mut server_wr).await?;
-        server_wr.shutdown().await
+        Ok::<_, std::io::Error>(())
     };
 
     let server_to_client = async {
         tokio::io::copy(&mut server_rd, &mut client_wr).await?;
-        client_wr.shutdown().await
+        Ok::<_, std::io::Error>(())
     };
 
-    try_join(client_to_server, server_to_client).await?;
+    tokio::try_join!(client_to_server, server_to_client)?;
     Ok(())
 }
 
@@ -86,41 +96,39 @@ async fn proxy_request(
 ) -> Result<Response<Body>, hyper::Error> {
     let path = req.uri().path();
     
-    // Get the backend for this path
     if let Some(backend) = config.get_backend_for_path(path) {
         println!("Routing request for path '{}' to backend: {}", path, backend);
 
-        // Check if this is a WebSocket upgrade request
+        // Check for WebSocket upgrade without consuming the request
         if req.headers().contains_key(hyper::header::UPGRADE) {
-            println!("Upgrading connection to WebSocket");
+            println!("WebSocket upgrade request detected");
             
-            // Parse the backend URL to get host and port
-            let backend_uri = backend.replace("http://", "");
-            let backend_uri = backend_uri.replace("https://", "");
-            
-            // Create upgrade response
             let mut response = Response::new(Body::empty());
             *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+            response.headers_mut().append(
+                hyper::header::CONNECTION,
+                hyper::header::HeaderValue::from_static("upgrade")
+            );
+            response.headers_mut().append(
+                hyper::header::UPGRADE,
+                hyper::header::HeaderValue::from_static("websocket")
+            );
             
-            // Copy upgrade headers from client request to response
-            if let Some(connection) = req.headers().get("connection") {
-                response.headers_mut().insert("connection", connection.clone());
+            // Generate WebSocket accept key if provided
+            if let Some(key) = req.headers().get("Sec-WebSocket-Key") {
+                let accept = generate_websocket_accept(key.to_str().unwrap());
+                response.headers_mut().append(
+                    "Sec-WebSocket-Accept",
+                    hyper::header::HeaderValue::from_str(&accept).unwrap()
+                );
             }
-            if let Some(upgrade) = req.headers().get("upgrade") {
-                response.headers_mut().insert("upgrade", upgrade.clone());
-            }
-            if let Some(key) = req.headers().get("sec-websocket-key") {
-                response.headers_mut().insert("sec-websocket-key", key.clone());
-            }
-            if let Some(version) = req.headers().get("sec-websocket-version") {
-                response.headers_mut().insert("sec-websocket-version", version.clone());
-            }
-            
+
             // Spawn a task to handle the WebSocket connection
-            tokio::task::spawn(async move {
+            let backend = backend.clone();
+            tokio::spawn(async move {
                 match hyper::upgrade::on(req).await {
                     Ok(upgraded) => {
-                        if let Err(e) = proxy_websocket(upgraded, backend_uri).await {
+                        if let Err(e) = proxy_websocket(upgraded, backend).await {
                             eprintln!("WebSocket proxy error: {}", e);
                         }
                     }
@@ -128,30 +136,29 @@ async fn proxy_request(
                 }
             });
 
-            Ok(response)
-        } else {
-            // Handle regular HTTP request as before
-            let (parts, body) = req.into_parts();
-            let uri_string = format!("{}{}", backend, parts.uri.path_and_query().map(|x| x.as_str()).unwrap_or(""));
-            let uri: Uri = uri_string.parse().unwrap();
-            
-            let mut new_req = Request::builder()
-                .method(parts.method)
-                .uri(uri);
-            
-            for (name, value) in parts.headers.iter() {
-                new_req = new_req.header(name, value);
-            }
-            
-            new_req = new_req.header("X-Forwarded-For", 
-                parts.headers.get("host").unwrap_or(&"unknown".parse().unwrap()));
-            new_req = new_req.header("X-Forwarded-Proto", "http");
-            
-            let new_req = new_req.body(body).unwrap();
-            client.request(new_req).await
+            return Ok(response);
         }
+
+        // Handle regular HTTP request
+        let (parts, body) = req.into_parts();
+        let uri_string = format!("{}{}", backend, parts.uri.path_and_query().map(|x| x.as_str()).unwrap_or(""));
+        let uri: Uri = uri_string.parse().unwrap();
+        
+        let mut new_req = Request::builder()
+            .method(parts.method)
+            .uri(uri);
+        
+        for (name, value) in parts.headers.iter() {
+            new_req = new_req.header(name, value);
+        }
+        
+        new_req = new_req.header("X-Forwarded-For", 
+            parts.headers.get("host").unwrap_or(&"unknown".parse().unwrap()));
+        new_req = new_req.header("X-Forwarded-Proto", "http");
+        
+        let new_req = new_req.body(body).unwrap();
+        client.request(new_req).await
     } else {
-        // No matching backend found
         let mut response = Response::new(Body::from("No service configured for this path"));
         *response.status_mut() = StatusCode::NOT_FOUND;
         Ok(response)
